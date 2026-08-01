@@ -1,4 +1,3 @@
-import asyncio
 import time
 from dataclasses import dataclass
 
@@ -14,11 +13,15 @@ class ArbitrageEngine:
         self.total_fee_margin = (2 * taker_fee_bps) / 10000.0
 
     def evaluate_spread(self, book_a: OrderBook, book_b: OrderBook):
-        # Direction 1: Buy A -> Sell B
+        """
+        Evaluates spatial arbitrage across two venues considering fee friction.
+        Returns trade direction and net spread in basis points (bps).
+        """
+        # Direction 1: Buy Exchange A -> Sell Exchange B
         spread_1 = (book_b.best_bid - book_a.best_ask) / book_a.best_ask
         net_yield_1 = spread_1 - self.total_fee_margin
 
-        # Direction 2: Buy B -> Sell A
+        # Direction 2: Buy Exchange B -> Sell Exchange A
         spread_2 = (book_a.best_bid - book_b.best_ask) / book_b.best_ask
         net_yield_2 = spread_2 - self.total_fee_margin
 
