@@ -1,114 +1,139 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+"""
+engine.py
+---------
+Trade-execution logic. Consumes quotes from two concurrent ExchangeFeed
+pollers, computes the net spread after modeled fees and latency decay,
+and decides whether to execute — sizing the trade via RiskManager.
+
+This is deliberately a *simulation*: no real order is sent anywhere. The
+purpose is to demonstrate the decision pipeline (detect -> cost-adjust ->
+size -> execute/skip -> record) under realistic concurrency and latency
+constraints, which is what the assignment's technical focus asks for.
+"""
+
+import asyncio
+import random
 import time
-import plotly.express as px
-from main import ArbitrageEngine, OrderBook
+from dataclasses import dataclass, field
 
-# --- Page Setup ---
-st.set_page_config(
-    page_title="HFT Arbitrage Feasibility Engine",
-    page_icon="⚡",
-    layout="wide"
-)
+from market_feed import ExchangeFeed, Quote, VolatilityRegime
+from latency_cost_model import opportunity_survival_probability, InfraTier
+from risk import RiskManager
 
-st.title("⚡ Algorithmic High-Frequency Arbitrage Feasibility Engine")
-st.markdown("Real-time monitoring for order book spreads, execution latency, and net yield.")
 
-# --- Sidebar Controls ---
-st.sidebar.header("Strategy Configuration")
-min_spread_bps = st.sidebar.slider("Min Profit Threshold (bps)", 1.0, 20.0, 5.0, 0.5)
-taker_fee_bps = st.sidebar.slider("Taker Fee per Leg (bps)", 0.0, 10.0, 1.5, 0.5)
-trade_size_usd = st.sidebar.number_input("Trade Size ($)", value=100000, step=10000)
-refresh_interval = st.sidebar.slider("Refresh Interval (s)", 0.2, 2.0, 0.5, 0.1)
-run_simulation = st.sidebar.checkbox("Run Live Feed Simulation", value=True)
+TAKER_FEE_BPS_PER_LEG = 5.0  # typical taker fee; paid on both legs of the arb
 
-# --- State Initialization ---
-if "log_data" not in st.session_state:
-    st.session_state.log_data = pd.DataFrame(
-        columns=["Timestamp", "Direction", "Spread_bps", "Latency_ms", "Profit_USD"]
-    )
 
-engine = ArbitrageEngine(min_profit_bps=min_spread_bps, taker_fee_bps=taker_fee_bps)
+@dataclass
+class ExecutionEvent:
+    ts: float
+    action: str            # "FILL" or "SKIP"
+    gross_edge_bps: float
+    net_edge_bps: float
+    notional_usd: float
+    pnl_usd: float
+    reason: str = ""
 
-# --- Top Level Metrics Containers ---
-col1, col2, col3, col4 = st.columns(4)
-m_price_a = col1.empty()
-m_price_b = col2.empty()
-m_spread = col3.empty()
-m_pnl = col4.empty()
 
-st.divider()
+@dataclass
+class SessionResult:
+    events: list = field(default_factory=list)
+    fills: int = 0
+    skips: int = 0
+    gross_pnl_usd: float = 0.0
 
-# --- Visualizations & Table Placeholders ---
-col_left, col_right = st.columns([2, 1])
+    def summary(self) -> dict:
+        return {
+            "fills": self.fills,
+            "skips": self.skips,
+            "fill_rate": round(self.fills / max(1, self.fills + self.skips), 3),
+            "gross_pnl_usd": round(self.gross_pnl_usd, 2),
+        }
 
-with col_left:
-    st.subheader("Live Net Spread Monitor (bps)")
-    chart_spot = st.empty()
 
-with col_right:
-    st.subheader("Execution Latency Distribution (ms)")
-    latency_spot = st.empty()
+async def run_session(
+    infra_tier: InfraTier,
+    regime: VolatilityRegime,
+    risk_manager: RiskManager,
+    duration_s: float = 20.0,
+    poll_interval_s: float = 0.25,
+    start_price: float = 50_000.0,
+) -> SessionResult:
+    """
+    Runs the concurrency pipeline for `duration_s` seconds of simulated time
+    and returns a SessionResult log. Two ExchangeFeed pollers run as
+    independent asyncio tasks, both writing into a shared queue; a third
+    task (this coroutine's main loop) consumes quotes and evaluates trades.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    stop_event = asyncio.Event()
 
-st.subheader("Order Execution Logs")
-table_spot = st.empty()
+    feed_a = ExchangeFeed("Exchange A", start_price, base_spread_bps=2.0,
+                           poll_interval_s=poll_interval_s, regime=regime)
+    feed_b = ExchangeFeed("Exchange B", start_price * 1.0007, base_spread_bps=2.0,
+                           poll_interval_s=poll_interval_s, regime=regime)
 
-# --- Live Execution Loop ---
-base_price = 50000.0
+    latency_s = infra_tier.network_latency_ms / 1000
+    jitter_s = infra_tier.jitter_ms / 1000
 
-if run_simulation:
-    for _ in range(30):
-        # Generate market order book price noise
-        bid_a = round(base_price + np.random.normal(0, 4), 2)
-        ask_a = round(bid_a + 0.5, 2)
-        bid_b = round(base_price + np.random.normal(0, 4), 2)
-        ask_b = round(bid_b + 0.5, 2)
+    task_a = asyncio.create_task(feed_a.poll(queue, latency_s, jitter_s, stop_event))
+    task_b = asyncio.create_task(feed_b.poll(queue, latency_s, jitter_s, stop_event))
 
-        book_a = OrderBook("Exchange_A", bid_a, ask_a)
-        book_b = OrderBook("Exchange_B", bid_b, ask_b)
+    latest: dict[str, Quote] = {}
+    result = SessionResult()
+    session_start = time.monotonic()
 
-        signal, net_spread_bps = engine.evaluate_spread(book_a, book_b)
-        latency_ms = round(np.random.uniform(0.5, 3.5), 2)
+    while time.monotonic() - session_start < duration_s:
+        try:
+            quote = await asyncio.wait_for(queue.get(), timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
+        latest[quote.exchange] = quote
 
-        if signal != "NO_TRADE":
-            profit = round(trade_size_usd * (net_spread_bps / 10000.0), 2)
-            new_row = pd.DataFrame([{
-                "Timestamp": time.strftime("%H:%M:%S"),
-                "Direction": signal,
-                "Spread_bps": round(net_spread_bps, 2),
-                "Latency_ms": latency_ms,
-                "Profit_USD": profit
-            }])
-            st.session_state.log_data = pd.concat([new_row, st.session_state.log_data]).head(25)
+        if "Exchange A" not in latest or "Exchange B" not in latest:
+            continue
 
-        # UI Refreshes
-        m_price_a.metric("Exchange A (Bid / Ask)", f"${bid_a} / ${ask_a}")
-        m_price_b.metric("Exchange B (Bid / Ask)", f"${bid_b} / ${ask_b}")
-        m_spread.metric("Net Spread Margin", f"{net_spread_bps:.2f} bps")
-        
-        total_pnl = st.session_state.log_data["Profit_USD"].sum() if not st.session_state.log_data.empty else 0.0
-        m_pnl.metric("Total Net Profit", f"${total_pnl:,.2f}")
+        qa, qb = latest["Exchange A"], latest["Exchange B"]
+        # try both directions: buy low venue, sell high venue
+        directions = [
+            (qa.ask, qb.bid, "buy A / sell B"),
+            (qb.ask, qa.bid, "buy B / sell A"),
+        ]
+        buy_px, sell_px, direction = max(directions, key=lambda d: d[1] - d[0])
 
-        if not st.session_state.log_data.empty:
-            fig_spread = px.line(
-                st.session_state.log_data, 
-                x="Timestamp", 
-                y="Spread_bps", 
-                title="Spread History", 
-                markers=True
-            )
-            chart_spot.plotly_chart(fig_spread, use_container_width=True)
+        gross_edge_bps = ((sell_px - buy_px) / buy_px) * 10_000
+        net_edge_bps = gross_edge_bps - (2 * TAKER_FEE_BPS_PER_LEG)
 
-            fig_lat = px.histogram(
-                st.session_state.log_data, 
-                x="Latency_ms", 
-                nbins=8, 
-                title="Latency Distribution", 
-                color_discrete_sequence=['#00CC96']
-            )
-            latency_spot.plotly_chart(fig_lat, use_container_width=True)
+        # latency decay: how much of this opportunity survives round-trip delay
+        survival = opportunity_survival_probability(infra_tier.network_latency_ms)
+        realized_edge_bps = net_edge_bps * survival
 
-            table_spot.dataframe(st.session_state.log_data, use_container_width=True)
+        notional = risk_manager.position_size_usd(regime)
 
-        time.sleep(refresh_interval)
+        if realized_edge_bps > 0 and notional > 0:
+            pnl = (realized_edge_bps / 10_000) * notional
+            # extreme-vol slippage haircut on fills
+            if regime is VolatilityRegime.EXTREME:
+                pnl *= random.uniform(0.4, 0.9)
+            risk_manager.record_fill(pnl)
+            result.fills += 1
+            result.gross_pnl_usd += pnl
+            result.events.append(ExecutionEvent(
+                ts=time.monotonic(), action="FILL",
+                gross_edge_bps=round(gross_edge_bps, 2), net_edge_bps=round(realized_edge_bps, 2),
+                notional_usd=round(notional, 2), pnl_usd=round(pnl, 2), reason=direction,
+            ))
+        else:
+            result.skips += 1
+            reason = "risk halted" if risk_manager.halted else "edge below cost threshold after latency decay"
+            result.events.append(ExecutionEvent(
+                ts=time.monotonic(), action="SKIP",
+                gross_edge_bps=round(gross_edge_bps, 2), net_edge_bps=round(realized_edge_bps, 2),
+                notional_usd=0.0, pnl_usd=0.0, reason=reason,
+            ))
+
+    stop_event.set()
+    for t in (task_a, task_b):
+        t.cancel()
+    return result
+    
